@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Ultimate Tracker + themes (no flash)</title>
+
+<!-- load required MediaPipe libraries as global scripts (not modules) -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+
+<style>
+html,body{
+margin:0;
+padding:0;
+overflow:hidden;
+background:black;
+font-family:monospace;
+}
+video,canvas{
+position:absolute;
+top:0;
+left:0;
+width:100%;
+height:100%;
+object-fit:cover;
+}
+#menu{
+position:fixed;
+top:20px;
+right:20px;
+width:250px;
+background:rgba(0,0,0,.9);
+border:1px solid #0ff;
+padding:15px;
+color:white;
+display:none;
+z-index:1000;
+backdrop-filter:blur(4px);
+border-radius:8px;
+}
+#menu input,
+#menu button{
+width:100%;
+margin-bottom:10px;
+box-sizing:border-box;
+}
+#menu button {
+background:#111;
+color:white;
+border:1px solid #0ff;
+padding:5px;
+cursor:pointer;
+}
+#menu button:hover {
+background:#0ff;
+color:black;
+}
+#fps{
+margin-top:10px;
+font-size:1.2em;
+color:#0f0;
+}
+kbd {
+background:#333;
+padding:2px 4px;
+border-radius:3px;
+}
+</style>
+</head>
+<body>
+
+<video id="video" autoplay playsinline muted></video>
+<canvas id="canvas"></canvas>
+
+<div id="menu">
+<h3>🎯 Tracker Menu</h3>
+<label>👤 Face Color</label>
+<input type="color" id="faceColor" value="#00ffcc">
+<label>🖐️ Hand Color</label>
+<input type="color" id="handColor" value="#AA00FF">
+<label>🧍 Body Color</label>
+<input type="color" id="bodyColor" value="#00FF00">
+<label>📏 Line Width</label>
+<input type="range" id="lineWidth" min="1" max="10" value="3">
+<div style="display:flex; gap:5px; flex-wrap:wrap;">
+  <button id="neonBtn">🌈 Neon</button>
+  <button id="purpleBtn">💜 Purple</button>
+  <button id="hackerBtn">💚 Hacker</button>
+  <button id="sunsetBtn">🌅 Sunset</button>
+  <button id="oceanBtn">🌊 Ocean</button>
+</div>
+<div id="fps">FPS: 0</div>
+<small style="color:#aaa; display:block; text-align:center;">press <kbd>X</kbd> to toggle menu</small>
+</div>
+
+<script type="module">
+// --- MODULE: FaceLandmarker (new tasks API) ---
+import {
+  FaceLandmarker,
+  FilesetResolver
+} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3";
+
+// --- DOM elements ---
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const menu = document.getElementById("menu");
+
+// --- config state ---
+let faceColor = "#00ffcc";
+let handColor = "#AA00FF";
+let bodyColor = "#00FF00";
+let lineWidth = 3;
+
+// --- tracker instances ---
+let faceTracker;
+let hands;        // from global Hands
+let pose;         // from global Pose
+
+// --- stored landmarks (to avoid flashing) ---
+let lastHandLandmarks = null;          // array of hand landmarks arrays
+let lastPoseLandmarks = null;          // pose landmarks array
+
+// --- frame counters ---
+let frame = 0;
+let fps = 0;
+let frames = 0;
+let lastTime = performance.now();
+
+// --- menu toggle (X key) ---
+document.addEventListener("keydown", (e) => {
+  if (e.key.toLowerCase() === "x") {
+    menu.style.display = menu.style.display === "none" ? "block" : "none";
+  }
+});
+
+// --- UI bindings ---
+document.getElementById("faceColor").addEventListener("input", e => faceColor = e.target.value);
+document.getElementById("handColor").addEventListener("input", e => handColor = e.target.value);
+document.getElementById("bodyColor").addEventListener("input", e => bodyColor = e.target.value);
+document.getElementById("lineWidth").addEventListener("input", e => lineWidth = parseInt(e.target.value, 10));
+
+// Theme buttons
+document.getElementById("neonBtn").addEventListener("click", () => {
+  faceColor = "#00ffff";
+  handColor = "#ff00ff";
+  bodyColor = "#39ff14";
+  updateColorInputs();
+});
+
+document.getElementById("purpleBtn").addEventListener("click", () => {
+  faceColor = "#d400ff";
+  handColor = "#aa00ff";
+  bodyColor = "#6600ff";
+  updateColorInputs();
+});
+
+document.getElementById("hackerBtn").addEventListener("click", () => {
+  faceColor = "#00ff00";   // bright green
+  handColor = "#00aa00";   // medium green
+  bodyColor = "#004400";   // dark green
+  updateColorInputs();
+});
+
+document.getElementById("sunsetBtn").addEventListener("click", () => {
+  faceColor = "#ff4500";   // orange red
+  handColor = "#ff8c00";   // dark orange
+  bodyColor = "#ffd700";   // gold
+  updateColorInputs();
+});
+
+document.getElementById("oceanBtn").addEventListener("click", () => {
+  faceColor = "#00ffff";   // cyan
+  handColor = "#1e90ff";   // dodger blue
+  bodyColor = "#0000ff";   // blue
+  updateColorInputs();
+});
+
+function updateColorInputs() {
+  document.getElementById("faceColor").value = faceColor;
+  document.getElementById("handColor").value = handColor;
+  document.getElementById("bodyColor").value = bodyColor;
+}
+
+// --- FPS meter ---
+function updateFPS() {
+  frames++;
+  const now = performance.now();
+  if (now - lastTime >= 1000) {
+    fps = frames;
+    frames = 0;
+    lastTime = now;
+    document.getElementById("fps").innerText = "FPS: " + fps;
+  }
+}
+
+// --- start camera ---
+async function startCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: "user",
+        width: { ideal: 640 },
+        height: { ideal: 360 }
+      }
+    });
+    video.srcObject = stream;
+    await new Promise(resolve => video.onloadeddata = resolve);
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    console.log(`Camera started: ${canvas.width}x${canvas.height}`);
+  } catch (err) {
+    console.error("Camera error:", err);
+    alert("Cannot access camera. Please grant permission.");
+  }
+}
+
+// --- FaceLandmarker ---
+async function initFace() {
+  try {
+    const vision = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
+    );
+    faceTracker = await FaceLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-assets/face_landmarker.task",
+        delegate: "GPU"
+      },
+      runningMode: "VIDEO",
+      numFaces: 1
+    });
+    console.log("FaceLandmarker ready");
+  } catch (err) {
+    console.error("Face init error:", err);
+  }
+}
+
+// --- Hands (store landmarks, not draw) ---
+function initHands() {
+  if (typeof Hands === "undefined") {
+    console.error("Hands library not loaded");
+    return;
+  }
+  hands = new Hands({
+    locateFile: file => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+  });
+  hands.setOptions({
+    maxNumHands: 2,
+    modelComplexity: 0,
+    minDetectionConfidence: 0.6,
+    minTrackingConfidence: 0.6
+  });
+  hands.onResults(results => {
+    // store landmarks (normalized)
+    if (results.multiHandLandmarks && results.multiHandLandmarks.length) {
+      lastHandLandmarks = results.multiHandLandmarks; // array of landmark arrays
+    } else {
+      lastHandLandmarks = null;
+    }
+  });
+  console.log("Hands tracker initialized");
+}
+
+// --- Pose (store landmarks) ---
+function initPose() {
+  if (typeof Pose === "undefined") {
+    console.error("Pose library not loaded");
+    return;
+  }
+  pose = new Pose({
+    locateFile: file => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`
+  });
+  pose.setOptions({
+    modelComplexity: 0,
+    smoothLandmarks: true,
+    minDetectionConfidence: 0.5,
+    minTrackingConfidence: 0.5
+  });
+  pose.onResults(results => {
+    if (results.poseLandmarks) {
+      lastPoseLandmarks = results.poseLandmarks;
+    } else {
+      lastPoseLandmarks = null;
+    }
+  });
+  console.log("Pose tracker initialized");
+}
+
+// --- draw face landmarks (simple dots) ---
+function drawFace(landmarks) {
+  if (!landmarks) return;
+  ctx.shadowColor = faceColor;
+  ctx.shadowBlur = 12;
+  ctx.fillStyle = faceColor;
+  for (const p of landmarks) {
+    const x = p.x * canvas.width;
+    const y = p.y * canvas.height;
+    ctx.beginPath();
+    ctx.arc(x, y, 2.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.shadowBlur = 0;
+}
+
+// --- draw stored hands ---
+function drawStoredHands() {
+  if (!lastHandLandmarks) return;
+  ctx.shadowColor = handColor;
+  ctx.shadowBlur = 12;
+  for (const landmarks of lastHandLandmarks) {
+    window.drawConnectors(ctx, landmarks, window.HAND_CONNECTIONS, {
+      color: handColor,
+      lineWidth: lineWidth
+    });
+    window.drawLandmarks(ctx, landmarks, {
+      color: handColor,
+      radius: 3,
+      lineWidth: 1
+    });
+  }
+  ctx.shadowBlur = 0;
+}
+
+// --- draw stored pose ---
+function drawStoredPose() {
+  if (!lastPoseLandmarks) return;
+  ctx.shadowColor = bodyColor;
+  ctx.shadowBlur = 12;
+  window.drawConnectors(ctx, lastPoseLandmarks, window.POSE_CONNECTIONS, {
+    color: bodyColor,
+    lineWidth: lineWidth
+  });
+  window.drawLandmarks(ctx, lastPoseLandmarks, {
+    color: bodyColor,
+    radius: 3,
+    lineWidth: 1
+  });
+  ctx.shadowBlur = 0;
+}
+
+// --- main animation loop ---
+async function loop() {
+  // Clear canvas every frame
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  if (video.readyState >= 2 && canvas.width > 0) {
+    // 1) Face tracking (synchronous)
+    if (faceTracker) {
+      try {
+        const faceResult = faceTracker.detectForVideo(video, performance.now());
+        if (faceResult.faceLandmarks && faceResult.faceLandmarks.length > 0) {
+          drawFace(faceResult.faceLandmarks[0]);
+        }
+      } catch (e) {
+        console.warn("Face detection error", e);
+      }
+    }
+
+    // 2) Draw stored hand & pose landmarks (from last async results)
+    drawStoredHands();
+    drawStoredPose();
+
+    // 3) Send new frames for hands & pose (every few frames to reduce load)
+    if (hands && frame % 2 === 0) {
+      await hands.send({ image: video }).catch(e => console.warn("Hands send error", e));
+    }
+    if (pose && frame % 3 === 0) {
+      await pose.send({ image: video }).catch(e => console.warn("Pose send error", e));
+    }
+
+    frame++;
+  }
+
+  updateFPS();
+  requestAnimationFrame(loop);
+}
+
+// --- bootstrap ---
+(async () => {
+  await startCamera();
+  await initFace();
+  initHands();
+  initPose();
+  loop();
+})();
+
+</script>
+</body>
+</html>
